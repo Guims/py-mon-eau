@@ -17,7 +17,7 @@ classifiers = [
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
 ]
-dependencies = ['aiohttp', 'asyncio', 'pyyaml', 'datetime']
+dependencies = ['aiohttp', 'pyyaml']
 [project.urls]
 "Homepage" = "https://github.com/Guims/py-mon-eau"
 "Bug Tracker" = "https://github.com/Guims/py-mon-eau/issues"
