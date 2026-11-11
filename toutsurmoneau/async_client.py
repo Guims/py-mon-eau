@@ -1,4 +1,5 @@
 import aiohttp
+import asyncio
 import datetime
 import calendar
 import logging
@@ -51,6 +52,10 @@ class AsyncClient():
         self._id = meter_id
         self._client_session = session
         self._use_litre = use_litre
+        # One login attempt per client instance. Do not retry rejected credentials.
+        self._auth_lock = asyncio.Lock()
+        self._authentication_attempted = False
+        self._authentication_failed = False
         # base url contains the scheme, address and base path
         if url is None:
             self._provider_url = GENERIC_BASE_URL
@@ -94,12 +99,7 @@ class AsyncClient():
         Clear login cookie to force logout and login next time.
         '''
         if self._client_session is not None:
-            self._client_session.cookie_jar.clear_domain(urlparse(self._api_base_url).netloc)
-
-    def _dump_cookie_jar(self, jar) -> None:
-        _LOGGER.debug('Cookie jar:')
-        for cookie in jar:
-            _LOGGER.debug(f'Domain: %s, Name: %s = %s', cookie['domain'], cookie.key, cookie.value)
+            self._client_session.cookie_jar.clear_domain(urlparse(self._provider_url).netloc)
 
     def _request(self, path: str, data=None, **kwargs: Any) -> aiohttp.ClientResponse:
         '''
@@ -109,16 +109,8 @@ class AsyncClient():
         '''
         if self._client_session is None:
             self._client_session = aiohttp.ClientSession()
-        self._dump_cookie_jar(self._client_session.cookie_jar)
-        _LOGGER.debug('=====================================================')
         full_url = self._full_url(path)
-        method = 'get'
-        if data is not None:
-            method = 'post'
-            _LOGGER.debug('Data: %s', data)
-        if 'params' in kwargs:
-            _LOGGER.debug('Params: %s', kwargs['params'])
-        _LOGGER.debug('Accessing: %s %s', method, full_url)
+        method = 'post' if data is not None else 'get'
         return self._client_session.request(
             method=method,
             url=full_url,
@@ -129,10 +121,6 @@ class AsyncClient():
         '''
         Validate the response, raise an exception if not successful.
         '''
-        _LOGGER.debug('Request Cookie: %s', response.request_info.headers.get('Cookie'))
-        _LOGGER.debug('Response: %s', response)
-        for cookie in response.cookies:
-            _LOGGER.debug('Response Cookie: %s', cookie)
         if response.status != success_code:
             response.raise_for_status()
             raise ClientError(f'HTTP error {response.status} for {response.url}')
@@ -148,57 +136,75 @@ class AsyncClient():
         result = matches.group(1)
         return result
 
-    async def _async_call_with_auth(self, endpoint, decode: bool = True, **kwargs: Any) -> Union[dict, str]:
-        '''
-        Call the specified endpoint ensuring authentication.
+    async def _async_get_endpoint(self, endpoint, decode=True, **kwargs):
+        """Make one API call; never retry authentication from this method."""
+        async with self._request(path=endpoint, **kwargs) as response:
+            self._validate_response(response)
+            if response.url.path.endswith(PAGE_LOGIN):
+                raise ClientError("Authentication required")
+            if not decode:
+                return await response.text(encoding='utf-8')
+            if 'application/json' not in response.headers.get('content-type', '').lower():
+                raise ClientError("Unexpected API content type")
+            result = await response.json()
+            if isinstance(result, list) and len(result) == 2 and result[0] == 'ERR':
+                raise ClientError("API rejected the request")
+            if isinstance(result, dict) and 'content' in result:
+                if result['content'] is None:
+                    raise ClientError("API returned an error")
+                result = result['content']
+            return result
 
-        :param endpoint: the endpoint to call
-        :param decode: if True, decode the result as JSON
-
-        :returns: the dict of result, or page
-        '''
-        _LOGGER.debug('Calling with auth: %s', endpoint)
-        # if first attempt fails, login, then try again
-        for attempt in range(1, 3):
-            async with self._request(path=endpoint, **kwargs) as response:
+    async def _async_login_once(self):
+        """One login POST at most, with no automatic retry on failure."""
+        if self._authentication_attempted:
+            raise ClientError("Authentication has already been attempted")
+        self._authentication_attempted = True
+        try:
+            async with self._request(path=PAGE_LOGIN) as response:
                 self._validate_response(response)
-                if not response.url.path.endswith(PAGE_LOGIN):
-                    # success !
-                    if not decode:
-                        return await response.text(encoding='utf-8')
-                    if 'application/json' not in response.headers.get('content-type'):
-                        raise ClientError('Failed getting data: not JSON content')
-                    result = await response.json()
-                    if isinstance(result, list) and len(result) == 2 and result[0] == 'ERR':
-                        raise ClientError(f'API returned error: {result[1]}')
-                    if isinstance(result, dict) and 'content' in result:
-                        if result['content'] == None:
-                            raise ClientError(f'API returned error: {result['message']}')    
-                        result=result['content']
-                    _LOGGER.debug('Result: %s', result)
-                    return result
-                # second attempt, after login failed
-                if attempt == 2:
-                    raise ClientError(f'Login failed.')
-                # first attempt failed, so try to login
-                _LOGGER.debug(f'Redirected to {PAGE_LOGIN}, performing login...')
-                # step 1: GET login page, retrieve CSRF token
-                csrf_token = None
-                async with self._request(path=PAGE_LOGIN) as response:
-                    text = await response.text(encoding='utf-8')
-                    csrf_token = self._find_in_text(text, CSRF_TOKEN_REGEX, PAGE_LOGIN)
-                csrf_token = csrf_token.encode('utf-8').decode('unicode-escape')
-                _LOGGER.debug('Token: %s', csrf_token)
-                # step 2: POST credentials in login page
-                credential_data = {
-                    '_csrf_token': csrf_token,
-                    'tsme_user_login[_username]': self._username,
-                    'tsme_user_login[_password]': self._password,
-                    'tsme_user_login[_target_path]': PAGE_DASHBOARD,
-                }
-                # cookies are set in the session
-                async with self._request(path=PAGE_LOGIN, data=credential_data, allow_redirects=True) as response:
-                    self._validate_response(response)
+                page_text = await response.text(encoding='utf-8')
+                csrf_token = self._find_in_text(page_text, CSRF_TOKEN_REGEX, PAGE_LOGIN)
+            csrf_token = csrf_token.encode('utf-8').decode('unicode-escape')
+            credential_data = {
+                '_csrf_token': csrf_token,
+                'tsme_user_login[_username]': self._username,
+                'tsme_user_login[_password]': self._password,
+                'tsme_user_login[_target_path]': PAGE_DASHBOARD,
+            }
+            async with self._request(
+                path=PAGE_LOGIN, data=credential_data, allow_redirects=True
+            ) as response:
+                self._validate_response(response)
+                if response.url.path.endswith(PAGE_LOGIN):
+                    raise ClientError("Authentication rejected")
+        except Exception:
+            self._authentication_failed = True
+            raise ClientError("Authentication failed; automatic retry disabled") from None
+
+    async def _async_call_with_auth(self, endpoint, decode: bool = True, **kwargs: Any) -> Union[dict, str]:
+        """Serialize API calls and never retry a failed login.
+
+        Initial access may require one login, followed by one API request.
+        After the session expires, do not send the credentials again.
+        """
+        async with self._auth_lock:
+            if self._authentication_failed:
+                raise ClientError("Authentication previously failed; retry disabled")
+            try:
+                return await self._async_get_endpoint(endpoint, decode=decode, **kwargs)
+            except ClientError as error:
+                if str(error) != "Authentication required":
+                    raise
+                if self._authentication_attempted:
+                    self._authentication_failed = True
+                    raise ClientError("Session expired; automatic login disabled") from None
+                await self._async_login_once()
+                try:
+                    return await self._async_get_endpoint(endpoint, decode=decode, **kwargs)
+                except Exception:
+                    self._authentication_failed = True
+                    raise ClientError("Request failed after login; retry disabled") from None
 
     async def async_meter_list(self) -> dict:
         '''
@@ -312,26 +318,29 @@ class AsyncClient():
                 result['absolute'][year][month_index] = self._convert_volume(i['index'])
         return result
 
-    async def async_latest_meter_reading(self, what='absolute', month_data=None) -> Union[float, int]:
-        '''
-        :returns: the latest meter reading
-        '''
-        reading_date = datetime.date.today()
-        # latest available value may be yesterday or the day before
-        for _ in range(METER_RETRIEVAL_MAX_DAYS_BACK):
-            test_day = reading_date.day
-            _LOGGER.debug('Trying day: %d', test_day)
-            try:
-                if month_data is None:
-                    month_data = await self.async_daily_for_month(reading_date)
-                if test_day in month_data[what]:
-                    return {'date': reading_date, 'volume': month_data[what][test_day]}
-            except Exception as error:
-                _LOGGER.debug('Error getting month data: %s', error)
-            reading_date = reading_date - datetime.timedelta(days=1)
-            if reading_date.day > test_day:
-                month_data = None
-        raise ClientError(f'Cannot get latest meter value in the last {METER_RETRIEVAL_MAX_DAYS_BACK} days')
+    async def async_latest_meter_reading(self, what='absolute', month_data=None):
+        """Get last available reading; never hide network or authentication errors."""
+        today = datetime.date.today()
+        if month_data is None:
+            month_data = await self.async_daily_for_month(today)
+        values = month_data[what]
+        days = [day for day in values if day <= today.day]
+        if days:
+            day = max(days)
+            return {
+                'date': today.replace(day=day),
+                'volume': values[day],
+            }
+        previous_day = today.replace(day=1) - datetime.timedelta(days=1)
+        previous = await self.async_daily_for_month(previous_day)
+        days = list(previous[what])
+        if days:
+            day = max(days)
+            return {
+                'date': previous_day.replace(day=day),
+                'volume': previous[what][day],
+            }
+        raise ClientError("No recent meter reading available")
 
     async def async_check_credentials(self) -> bool:
         '''
@@ -340,6 +349,5 @@ class AsyncClient():
         try:
             await self.async_contracts()
             return True
-        except Exception as error:
-            _LOGGER.debug('Login failed: %s', error)
+        except Exception:
             return False
